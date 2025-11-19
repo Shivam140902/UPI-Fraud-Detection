@@ -1,123 +1,142 @@
+# app.py -- SQLite-converted version (keeps ML)
+import os
+import random
+import ssl
+import smtplib
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
-from flask import Flask, request, render_template, redirect, url_for, session, flash, g
-import mysql.connector
-from datetime import datetime, timedelta
-import random
-import smtplib
-import ssl
-import os
+from flask import Flask, g, redirect, render_template, request, session, url_for, flash
+from sklearn.preprocessing import StandardScaler
+import sqlite3
 
-# --- Database Configuration (IMPORTANT: Update your credentials here or use environment variables) ---
-# This dictionary holds your MySQL database connection details.
-# Replace 'root' with your MySQL username, '' with your password, and 'upi_fraud1' with your database name.
-DB_CONFIG = {
-    'user': 'shivam',
-    'password': 'Shivam@4408',
-    'host': 'db4free.net',
-    'database': 'upi_fraud_db',
-    'port': 3306
-}
+# ---------------- Configuration ----------------
+# SQLite DB filename
+SQLITE_DB = os.environ.get("SQLITE_DB", "database.sqlite3")
 
-
-# --- SMTP Configuration for Email (IMPORTANT: Update your credentials) ---
-# These are used for sending OTPs via email.
-# SENDER_EMAIL: The email address from which OTPs will be sent.
-# SENDER_PASSWORD: The app password for the SENDER_EMAIL (NOT your regular email password).
-# You should generate an app password for security if using Gmail.
-SMTP_SERVER = "smtp.gmail.com"
+# SMTP config
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "way2track01@gmail.com")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "masvczanrdbufpuq") # Use an "App Password" for Gmail
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "masvczanrdbufpuq")
 
-# --- Global Variables for ML Model and Scaler ---
-# These variables will hold the loaded machine learning model and the StandardScaler.
-# They are initialized to None and loaded when the application starts.
+# ML files (must exist in repo)
+DATASET_CSV = "upi_fraud_dataset.csv"
+MODEL_PATH = "model/project_model2.h5"
+
+# Flask app
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET", "your_super_secret_key_change_this_in_production")
+
+# Globals for ML assets
 model = None
 scaler = None
 
-# --- Flask App Initialization ---
-app = Flask(__name__)
-# Set a strong, unique secret key for session management.
-# This is crucial for security; never use a default or easily guessable key in production.
-app.secret_key = 'your_super_secret_key_change_this_in_production'
-
-# --- Database Connection Management ---
+# ---------------- SQLite helpers ----------------
 def get_db():
-    """
-    Establishes a new database connection if one doesn't exist for the current request.
-    Stores the connection on Flask's 'g' object to reuse it within the same request.
-    """
-    if 'db' not in g:
-        try:
-            g.db = mysql.connector.connect(**DB_CONFIG)
-        except mysql.connector.Error as err:
-            print(f"Database connection error: {err}")
-            g.db = None # Set to None if connection fails
-    return g.db
+    """Return a connection to the SQLite DB (attached to flask.g)."""
+    db = g.get("_sqlite_db", None)
+    if db is None:
+        conn = sqlite3.connect(SQLITE_DB, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        g._sqlite_db = conn
+        db = conn
+    return db
 
-def close_db(e=None):
-    """
-    Closes the database connection at the end of the request.
-    """
-    db = g.pop('db', None)
-    if db is not None and db.is_connected():
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("_sqlite_db", None)
+    if db is not None:
         db.close()
 
-# Register the close_db function to be called after each request, even if an error occurs.
-app.teardown_appcontext(close_db)
+def init_db():
+    """Create required tables if they don't exist."""
+    conn = get_db()
+    cur = conn.cursor()
+    # bank_accounts: OTP fields as text, otp_expiry as ISO string
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        full_name TEXT,
+        dob TEXT,                 -- stored as 'YYYY-MM-DD'
+        mobile_number TEXT UNIQUE,
+        email TEXT UNIQUE,
+        location TEXT,
+        state INTEGER,
+        zip INTEGER,
+        otp TEXT,
+        otp_expiry TEXT,
+        creation_date TEXT DEFAULT (datetime('now'))
+    );
+    """)
+    # merchants
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS merchants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mobile_number TEXT,
+        upi_number TEXT UNIQUE,
+        category INTEGER,
+        FOREIGN KEY (mobile_number) REFERENCES bank_accounts(mobile_number)
+    );
+    """)
+    # transactions
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_mobile TEXT,
+        merchant_upi TEXT,
+        trans_amount REAL,
+        status TEXT,
+        trans_hour INTEGER,
+        trans_day INTEGER,
+        trans_month INTEGER,
+        trans_year INTEGER,
+        category INTEGER,
+        age INTEGER,
+        state INTEGER,
+        zip INTEGER,
+        trans_date TEXT,  -- store date as ISO (YYYY-MM-DD)
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    """)
+    conn.commit()
 
-# --- ML Model and Scaler Setup (Loaded once at app startup) ---
+# ---------------- ML loading ----------------
 def load_ml_assets():
-    """
-    Loads the pre-trained machine learning model and scaler when the Flask app first starts.
-    This prevents reloading them for every request, improving performance.
-    """
+    """Load scaler (fit from CSV) and Keras model if available."""
     global model, scaler
+    # Load scaler
     try:
-        # Load the dataset to fit the scaler.
-        # Ensure 'upi_fraud_dataset.csv' is in the same directory as app.py or provide a full path.
-        dataset = pd.read_csv('upi_fraud_dataset.csv')
-
-        # Features for scaling: all columns EXCEPT 'fraud_risk' (the last column).
-        # This ensures the scaler is fitted on the same 10 features the model expects.
-        # Columns: trans_hour, trans_day, trans_month, trans_year, category, upi_number, age, trans_amount, state, zip
-        x_for_scaling = dataset.iloc[:, :10].values
+        dataset = pd.read_csv(DATASET_CSV)
+        x_for_scaling = dataset.iloc[:, :10].values  # match your training order
         scaler = StandardScaler()
-        scaler.fit(x_for_scaling) # Fit the scaler on the training data features
+        scaler.fit(x_for_scaling)
         print("Scaler fitted successfully.")
-
     except FileNotFoundError:
         scaler = None
-        print("Warning: 'upi_fraud_dataset.csv' not found. Scaler not loaded.")
+        print(f"Warning: '{DATASET_CSV}' not found. Scaler not loaded.")
     except Exception as e:
         scaler = None
         print(f"Error loading or fitting scaler: {e}")
 
+    # Load model
     try:
-        # Load the Keras model.
-        # Ensure 'model/project_model2.h5' exists relative to app.py or provide a full path.
-        model = tf.keras.models.load_model('model/project_model2.h5')
+        model = tf.keras.models.load_model(MODEL_PATH)
         print("Model loaded successfully.")
     except (FileNotFoundError, IOError):
         model = None
-        print("Error: 'model/project_model2.h5' not found. Model not loaded.")
+        print(f"Error: '{MODEL_PATH}' not found. Model not loaded.")
     except Exception as e:
         model = None
         print(f"Error loading model: {e}")
 
-# --- Helper Functions ---
+# ---------------- Helper functions ----------------
 def send_otp_email(receiver_email, otp):
-    """
-    Sends an OTP to the specified email address.
-    """
     subject = "Your SecurePay OTP Verification"
     body = f"Your One-Time Password (OTP) for SecurePay is: {otp}. It is valid for 5 minutes."
     message = f"Subject: {subject}\n\n{body}"
-
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
@@ -129,128 +148,104 @@ def send_otp_email(receiver_email, otp):
         return False
 
 def generate_otp():
-    """
-    Generates a 6-digit numeric OTP.
-    """
     return str(random.randint(100000, 999999))
 
+def parse_iso_datetime(s):
+    if not s:
+        return None
+    try:
+        # try full datetime first
+        return datetime.fromisoformat(s)
+    except Exception:
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d")
+            except Exception:
+                return None
+
 def predict_fraud(transaction_features):
-    """
-    Predicts fraud risk using the loaded ML model and scaler.
-    Args:
-        transaction_features (list): A list of 10 numerical features for the transaction.
-                                     Order must match the training data:
-                                     [trans_hour, trans_day, trans_month, trans_year, category,
-                                      upi_number_dummy, age, trans_amount, state, zip]
-                                      Note: upi_number_dummy is a placeholder for the dataset's upi_number column,
-                                      which was likely an identifier and not a predictive feature.
-    Returns:
-        int: 1 if fraud is predicted, 0 otherwise.
-             Returns -1 if model or scaler is not loaded.
-    """
+    """Return 1 for fraud, 0 for valid, -1 on error/missing model."""
     global model, scaler
     if model is None or scaler is None:
         print("ML model or scaler not loaded. Cannot predict fraud.")
-        return -1 # Indicate an error state
-
+        return -1
     try:
-        # Reshape the input data to be a 2D array (1 sample, 10 features)
         input_array = np.array(transaction_features).reshape(1, -1)
-
-        # Scale the input features using the loaded scaler
-        scaled_features = scaler.transform(input_array)
-
-        # Make prediction
-        prediction_proba = model.predict(scaled_features)[0][0]
-        # Assuming a binary classification model where output > 0.5 means fraud
-        fraud_risk = 1 if prediction_proba > 0.5 else 0
+        scaled = scaler.transform(input_array)
+        pred = model.predict(scaled)
+        # Try to handle multiple output shapes
+        if isinstance(pred, np.ndarray):
+            p = pred.flatten()[0]
+        else:
+            p = float(pred)
+        fraud_risk = 1 if p > 0.5 else 0
         return fraud_risk
     except Exception as e:
         print(f"Error during fraud prediction: {e}")
-        return -1 # Indicate an error state
+        return -1
 
-# --- Routes ---
-
+# ---------------- Routes ----------------
 @app.route('/')
 def index():
-    """
-    Renders the index page.
-    """
     return render_template('index.html')
 
+# ---------- Login (user via mobile+OTP; admin via username/password) ----------
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    """
-    Handles user and admin login.
-    Users log in with mobile number and OTP. Admins log in with username/password.
-    """
     if 'mobile' in session:
-        if session.get('user_type') == 'user':
+        t = session.get('user_type')
+        if t == 'user':
             return redirect(url_for('user_dashboard'))
-        elif session.get('user_type') == 'merchant':
+        if t == 'merchant':
             return redirect(url_for('merchant_dashboard'))
-        elif session.get('user_type') == 'admin':
+        if t == 'admin':
             return redirect(url_for('admin_dashboard'))
 
     if request.method == 'POST':
-        form_type = request.form.get('form_type') # Distinguish between user and admin login forms
-        
+        form_type = request.form.get('form_type')
         conn = get_db()
-        if conn is None:
-            flash('Database connection error. Please try again later.', 'danger')
-            return render_template('login.html')
-
-        cursor = conn.cursor(dictionary=True)
-
+        cur = conn.cursor()
         if form_type == 'user':
             mobile_number = request.form.get('mobile_number')
             if not mobile_number:
                 flash('Mobile number is required for user login.', 'danger')
-                cursor.close()
                 return render_template('login.html')
-            
             try:
-                cursor.execute("SELECT * FROM bank_accounts WHERE mobile_number = %s", (mobile_number,))
-                user = cursor.fetchone()
+                cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (mobile_number,))
+                user = cur.fetchone()
                 if user:
-                    # Generate and send OTP for user
                     otp = generate_otp()
-                    otp_expiry = datetime.now() + timedelta(minutes=5)
-                    cursor.execute("UPDATE bank_accounts SET otp = %s, otp_expiry = %s WHERE mobile_number = %s",
-                                   (otp, otp_expiry, mobile_number))
+                    otp_expiry = (datetime.now() + timedelta(minutes=5)).isoformat()
+                    cur.execute("UPDATE bank_accounts SET otp = ?, otp_expiry = ? WHERE mobile_number = ?",
+                                (otp, otp_expiry, mobile_number))
                     conn.commit()
-
-                    if send_otp_email(user['email'], otp):
+                    if send_otp_email(user["email"], otp):
                         session['mobile'] = mobile_number
-                        session['user_type'] = 'user' # Temporarily set user type for session
+                        session['user_type'] = 'user'
                         flash('OTP sent to your registered email. Please verify to log in.', 'info')
-                        cursor.close()
                         return redirect(url_for('verify_otp', mobile=mobile_number))
                     else:
                         flash('Failed to send OTP. Please try again.', 'danger')
                 else:
                     flash('User account not found. Please register.', 'danger')
-            except mysql.connector.Error as err:
-                flash(f'Database error: {err}', 'danger')
+            except Exception as e:
+                flash(f'Database error: {e}', 'danger')
             finally:
-                if conn.is_connected():
-                    cursor.close()
+                cur.close()
 
         elif form_type == 'admin':
             username = request.form.get('username')
-            password = request.form.get('password') 
-            
+            password = request.form.get('password')
             if not username or not password:
                 flash('Username and password are required for admin login.', 'danger')
-                cursor.close()
                 return render_template('login.html')
-
-            # --- Admin Credentials (Hardcoded - Replace with DB lookup in production) ---
-            if username == 'admin' and password == 'admin': 
-                session['mobile'] = '0000000000' # Dummy mobile for admin
+            # Hardcoded admin (you can replace with DB later)
+            if username == 'admin' and password == 'admin':
+                session['mobile'] = '0000000000'
                 session['user_type'] = 'admin'
                 flash('Admin login successful!', 'success')
-                cursor.close()
                 return redirect(url_for('admin_dashboard'))
             else:
                 flash('Invalid admin credentials.', 'danger')
@@ -261,9 +256,6 @@ def login():
 
 @app.route('/verify_otp/<mobile>', methods=['GET', 'POST'])
 def verify_otp(mobile):
-    """
-    Handles OTP verification for user login.
-    """
     if 'mobile' not in session or session['mobile'] != mobile:
         flash('Invalid request. Please log in again.', 'danger')
         return redirect(url_for('login'))
@@ -271,144 +263,117 @@ def verify_otp(mobile):
     if request.method == 'POST':
         user_otp = request.form.get('otp')
         conn = get_db()
-        if conn is None:
-            flash('Database connection error. Please try again later.', 'danger')
-            return render_template('verify_otp.html', mobile=mobile)
-
-        cursor = conn.cursor(dictionary=True)
+        cur = conn.cursor()
         try:
-            cursor.execute("SELECT otp, otp_expiry FROM bank_accounts WHERE mobile_number = %s", (mobile,))
-            user_data = cursor.fetchone()
-
-            if user_data and user_data['otp'] == user_otp and user_data['otp_expiry'] > datetime.now():
-                # OTP is valid, clear it from DB for security
-                cursor.execute("UPDATE bank_accounts SET otp = NULL, otp_expiry = NULL WHERE mobile_number = %s", (mobile,))
-                conn.commit()
-
-                # Check if user is also a merchant
-                cursor.execute("SELECT * FROM merchants WHERE mobile_number = %s", (mobile,))
-                merchant_info = cursor.fetchone()
-                if merchant_info:
-                    session['user_type'] = 'merchant'
-                    flash('Login successful as Merchant!', 'success')
-                    return redirect(url_for('merchant_dashboard'))
+            cur.execute("SELECT otp, otp_expiry FROM bank_accounts WHERE mobile_number = ?", (mobile,))
+            row = cur.fetchone()
+            if row:
+                stored_otp = row["otp"]
+                expiry_raw = row["otp_expiry"]
+                expiry_dt = parse_iso_datetime(expiry_raw)
+                if stored_otp == user_otp and expiry_dt and expiry_dt > datetime.now():
+                    # clear otp
+                    cur.execute("UPDATE bank_accounts SET otp = NULL, otp_expiry = NULL WHERE mobile_number = ?", (mobile,))
+                    conn.commit()
+                    # check merchant
+                    cur.execute("SELECT * FROM merchants WHERE mobile_number = ?", (mobile,))
+                    merchant_info = cur.fetchone()
+                    if merchant_info:
+                        session['user_type'] = 'merchant'
+                        flash('Login successful as Merchant!', 'success')
+                        return redirect(url_for('merchant_dashboard'))
+                    else:
+                        session['user_type'] = 'user'
+                        flash('Login successful as User!', 'success')
+                        return redirect(url_for('user_dashboard'))
+                elif expiry_dt and expiry_dt <= datetime.now():
+                    flash('OTP has expired. Please log in again to get a new OTP.', 'danger')
+                    return redirect(url_for('login'))
                 else:
-                    session['user_type'] = 'user'
-                    flash('Login successful as User!', 'success')
-                    return redirect(url_for('user_dashboard'))
-            elif user_data and user_data['otp_expiry'] <= datetime.now():
-                flash('OTP has expired. Please log in again to get a new OTP.', 'danger')
-                return redirect(url_for('login'))
+                    flash('Invalid OTP. Please try again.', 'danger')
             else:
-                flash('Invalid OTP. Please try again.', 'danger')
-        except mysql.connector.Error as err:
-            flash(f'Database error: {err}', 'danger')
+                flash('User not found. Please register.', 'danger')
+        except Exception as e:
+            flash(f'Database error: {e}', 'danger')
         finally:
-            if conn.is_connected():
-                cursor.close()
+            cur.close()
+
     return render_template('verify_otp.html', mobile=mobile)
 
+# ---------- Registration ----------
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    """
-    Handles new user registration into the bank_accounts table.
-    """
     if request.method == 'POST':
         full_name = request.form.get('full_name')
-        dob_str = request.form.get('dob') # Date of Birth as string
+        dob_str = request.form.get('dob')
         mobile_number = request.form.get('mobile_number')
         email = request.form.get('email')
         location = request.form.get('location')
-        state = request.form.get('state') # This should be the numerical ID
+        state = request.form.get('state')
         zip_code = request.form.get('zip')
 
-        # Basic validation
         if not all([full_name, dob_str, mobile_number, email, location, state, zip_code]):
             flash('All fields are required!', 'danger')
             return render_template('register.html')
 
         try:
-            dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
+            # validate dob format
+            datetime.strptime(dob_str, '%Y-%m-%d')
         except ValueError:
             flash('Invalid date format for Date of Birth. Please use YYYY-MM-DD.', 'danger')
             return render_template('register.html')
 
         conn = get_db()
-        if conn is None:
-            flash('Database error. Cannot create account.', 'danger')
-            return render_template('register.html')
-
-        cursor = conn.cursor()
+        cur = conn.cursor()
         try:
-            # Check for duplicate mobile or email
-            cursor.execute('SELECT * FROM bank_accounts WHERE mobile_number = %s OR email = %s', (mobile_number, email))
-            if cursor.fetchone():
+            cur.execute("SELECT 1 FROM bank_accounts WHERE mobile_number = ? OR email = ?", (mobile_number, email))
+            if cur.fetchone():
                 flash('Mobile number or email already registered.', 'danger')
                 return render_template('register.html')
-
-            cursor.execute(
-                'INSERT INTO bank_accounts (full_name, dob, mobile_number, email, location, state, zip) VALUES (%s, %s, %s, %s, %s, %s, %s)',
-                (full_name, dob, mobile_number, email, location, state, zip_code)
-            )
+            cur.execute("""
+                INSERT INTO bank_accounts (full_name, dob, mobile_number, email, location, state, zip)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (full_name, dob_str, mobile_number, email, location, int(state), int(zip_code)))
             conn.commit()
             flash('Registration successful! You can now log in.', 'success')
             return redirect(url_for('login'))
-        except mysql.connector.IntegrityError as e:
-            if "Duplicate entry" in str(e) and ("'mobile_number'" in str(e) or "'email'" in str(e)):
-                flash('Mobile number or email already registered.', 'danger')
-            else:
-                flash(f'Database error: {e}', 'danger')
         except Exception as e:
             flash(f'An unexpected error occurred: {e}', 'danger')
         finally:
-            if conn.is_connected():
-                cursor.close()
+            cur.close()
+
     return render_template('register.html')
 
 @app.route('/logout')
 def logout():
-    """
-    Logs out the current user by clearing the session.
-    """
     session.clear()
     flash('You have been logged out.', 'info')
     return redirect(url_for('index'))
 
-# --- User Routes ---
-
+# ---------- User pages ----------
 @app.route('/user_dashboard')
 def user_dashboard():
-    """
-    Displays the user dashboard.
-    Requires user to be logged in as 'user' or 'merchant' (as merchants also have user accounts).
-    """
     if session.get('user_type') not in ['user', 'merchant']:
         flash('Please log in to access your dashboard.', 'warning')
         return redirect(url_for('login'))
-    
+
     user_mobile = session['mobile']
     conn = get_db()
-    if conn is None:
-        flash('Database error. Cannot retrieve user info.', 'danger')
-        return render_template('user.html', user=None) # Changed to user.html
-
-    cursor = conn.cursor(dictionary=True)
+    cur = conn.cursor()
     user_info = None
     try:
-        cursor.execute("SELECT * FROM bank_accounts WHERE mobile_number = %s", (user_mobile,))
-        user_info = cursor.fetchone()
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (user_mobile,))
+        row = cur.fetchone()
+        if row:
+            user_info = dict(row)
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if conn.is_connected():
-            cursor.close()
-    return render_template('user.html', user=user_info) # Changed to user.html
+        cur.close()
+    return render_template('user.html', user=user_info)
+
 @app.route('/user/profile')
 def user_profile_page():
-    """
-    Displays the user's profile information.
-    """
-    # 1️⃣ Check if user is logged in
     if session.get('user_type') not in ['user', 'merchant']:
         flash('Please log in to view your profile.', 'warning')
         return redirect(url_for('login'))
@@ -418,43 +383,25 @@ def user_profile_page():
         flash('Session error: Mobile number missing.', 'danger')
         return redirect(url_for('login'))
 
-    # 2️⃣ Connect to the database
     conn = get_db()
-    if conn is None:
-        flash('Database error. Cannot retrieve user profile.', 'danger')
-        return render_template('user_profile_page.html', user=None)
-
-    # 3️⃣ Fetch user info
-    cursor = conn.cursor(dictionary=True)
+    cur = conn.cursor()
     user_info = None
-
     try:
-        cursor.execute("SELECT * FROM bank_accounts WHERE mobile_number = %s", (user_mobile,))
-        user_info = cursor.fetchone()
-
-        # 🧠 Safety check: if creation_date missing or string, handle it
-        if user_info and 'creation_date' in user_info and isinstance(user_info['creation_date'], str):
-            from datetime import datetime
-            try:
-                user_info['creation_date'] = datetime.strptime(user_info['creation_date'], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                user_info['creation_date'] = None
-
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (user_mobile,))
+        row = cur.fetchone()
+        if row:
+            user_info = dict(row)
+            if 'creation_date' in user_info and isinstance(user_info['creation_date'], str):
+                # try to parse it to presentable format on template if needed
+                user_info['creation_date_raw'] = user_info['creation_date']
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if conn.is_connected():
-            cursor.close()
-            conn.close()
-
-    # 4️⃣ Return the profile template
+        cur.close()
     return render_template('user_profile_page.html', user=user_info)
 
 @app.route('/user/make_payment', methods=['GET'])
 def user_make_payment_page():
-    """
-    Renders the page for making a new payment.
-    """
     if session.get('user_type') not in ['user', 'merchant']:
         flash('Please log in to make a payment.', 'warning')
         return redirect(url_for('login'))
@@ -462,37 +409,25 @@ def user_make_payment_page():
 
 @app.route('/user/transactions', methods=['GET'])
 def user_transactions_page():
-    """
-    Displays the user's transaction history.
-    """
     if session.get('user_type') not in ['user', 'merchant']:
         flash('Please log in to view your transactions.', 'warning')
         return redirect(url_for('login'))
-    
     user_mobile = session['mobile']
     conn = get_db()
-    if conn is None:
-        flash('Database error. Cannot retrieve transactions.', 'danger')
-        return render_template('user_transactions_page.html', transactions=[])
-
+    cur = conn.cursor()
     transactions = []
     try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute('SELECT * FROM transactions WHERE user_mobile = %s ORDER BY trans_date DESC', (user_mobile,))
-        transactions = cursor.fetchall()
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM transactions WHERE user_mobile = ? ORDER BY trans_date DESC", (user_mobile,))
+        rows = cur.fetchall()
+        transactions = [dict(r) for r in rows]
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if conn.is_connected():
-            cursor.close()
+        cur.close()
     return render_template('user_transactions_page.html', transactions=transactions)
-
 
 @app.route('/user/pay', methods=['POST'])
 def user_pay():
-    """
-    Processes a payment, performs fraud detection, and records the transaction.
-    """
     if session.get('user_type') not in ['user', 'merchant']:
         flash('Please log in to make a payment.', 'warning')
         return redirect(url_for('login'))
@@ -504,119 +439,84 @@ def user_pay():
     merchant_upi = request.form.get('merchant_upi')
     try:
         trans_amount = float(request.form.get('trans_amount'))
-    except ValueError:
+    except (TypeError, ValueError):
         flash('Invalid transaction amount.', 'danger')
         return redirect(url_for('user_make_payment_page'))
 
     user_mobile = session['mobile']
-
     conn = get_db()
-    if conn is None:
-        flash('Database connection error. Cannot process payment.', 'danger')
-        return redirect(url_for('user_make_payment_page'))
-
-    cursor = conn.cursor(dictionary=True)
-
+    cur = conn.cursor()
     try:
-        # 1. Get User Details
-        cursor.execute("SELECT dob, state, zip FROM bank_accounts WHERE mobile_number = %s", (user_mobile,))
-        user_details = cursor.fetchone()
+        # user details
+        cur.execute("SELECT dob, state, zip FROM bank_accounts WHERE mobile_number = ?", (user_mobile,))
+        user_details = cur.fetchone()
         if not user_details:
             flash('User details not found. Cannot process payment.', 'danger')
             return redirect(url_for('user_make_payment_page'))
 
-        # 2. Get Merchant Details
-        cursor.execute("SELECT category FROM merchants WHERE upi_number = %s", (merchant_upi,))
-        merchant_details = cursor.fetchone()
+        # merchant details
+        cur.execute("SELECT category FROM merchants WHERE upi_number = ?", (merchant_upi,))
+        merchant_details = cur.fetchone()
         if not merchant_details:
             flash('Merchant not found. Please check UPI number.', 'danger')
             return redirect(url_for('user_make_payment_page'))
 
-        # 3. Prepare features for fraud prediction
+        # features
         now = datetime.now()
         trans_hour = now.hour
         trans_day = now.day
         trans_month = now.month
         trans_year = now.year
-        category = int(merchant_details['category'])
+        category = int(merchant_details["category"])
 
-        # Calculate age
-        age = now.year - user_details['dob'].year - ((now.month, now.day) < (user_details['dob'].month, user_details['dob'].day))
-        state = int(user_details['state'])
-        zip_code = int(user_details['zip'])
+        # calculate age (dob stored as YYYY-MM-DD)
+        dob_str = user_details["dob"]
+        try:
+            dob_dt = datetime.strptime(dob_str, "%Y-%m-%d")
+            age = now.year - dob_dt.year - ((now.month, now.day) < (dob_dt.month, dob_dt.day))
+        except Exception:
+            age = 0
 
-        # Construct input features (match your ML training order)
+        state = int(user_details["state"]) if user_details["state"] is not None else 0
+        zip_code = int(user_details["zip"]) if user_details["zip"] is not None else 0
+
         transaction_features = [
-            trans_hour,
-            trans_day,
-            trans_month,
-            trans_year,
-            category,
-            0,        # Dummy for UPI ID
-            age,
-            trans_amount,
-            state,
-            zip_code
+            trans_hour, trans_day, trans_month, trans_year,
+            category, 0,  # dummy upi id
+            age, trans_amount, state, zip_code
         ]
 
-        # Debug: print features
+        # debug prints (visible on server logs)
         print("Transaction features (before scaling):", transaction_features)
 
-        # Scale features
         features_scaled = scaler.transform([transaction_features])
         print("Transaction features (after scaling):", features_scaled)
 
-        # Predict fraud risk
-        fraud_risk = model.predict(features_scaled)[0]  # 1 = fraud, 0 = valid
+        fraud_risk = predict_fraud(transaction_features)
         print("Predicted fraud risk:", fraud_risk)
 
         status = 'FRAUDULENT' if fraud_risk == 1 else 'VALID'
-        output_message = (
-            "Transaction is VALID and processed securely." 
-            if status == 'VALID' 
-            else "FRAUDULENT transaction detected! Payment blocked."
-        )
+        output_message = "Transaction is VALID and processed securely." if status == 'VALID' else "FRAUDULENT transaction detected! Payment blocked."
 
-        # Record transaction
-        cursor.execute(
-            '''
-            INSERT INTO transactions 
+        cur.execute("""
+            INSERT INTO transactions
             (user_mobile, merchant_upi, trans_amount, status, trans_hour, trans_day, trans_month, trans_year, category, age, state, zip, trans_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ''',
-            (user_mobile, merchant_upi, trans_amount, status, trans_hour, trans_day, trans_month, trans_year, category, age, state, zip_code, now.date())
-        )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_mobile, merchant_upi, trans_amount, status, trans_hour, trans_day, trans_month, trans_year, category, age, state, zip_code, now.date().isoformat()))
         conn.commit()
 
         return render_template('result.html', status=status.lower(), OUTPUT=output_message)
 
-    except ValueError as ve:
-        flash(f'Input data error: {ve}. Please check your input values.', 'danger')
-        print(f"ValueError in user_pay: {ve}")
-        return redirect(url_for('user_make_payment_page'))
-
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
-        print(f"Database error in user_pay: {err}")
-        return redirect(url_for('user_make_payment_page'))
-
     except Exception as e:
         flash(f'An unexpected error occurred: {e}', 'danger')
-        print(f"General error in user_pay: {e}")
+        print(f"Error in user_pay: {e}")
         return redirect(url_for('user_make_payment_page'))
-
     finally:
-        if conn.is_connected():
-            cursor.close()
+        cur.close()
 
-# --- Admin Routes ---
-
+# ---------- Admin routes ----------
 @app.route('/admin_dashboard')
 def admin_dashboard():
-    """
-    Displays the admin dashboard.
-    Requires user to be logged in as 'admin'.
-    """
     if session.get('user_type') != 'admin':
         flash('Unauthorized access.', 'danger')
         return redirect(url_for('login'))
@@ -624,243 +524,185 @@ def admin_dashboard():
 
 @app.route('/admin/users')
 def admin_users_page():
-    """
-    Displays a list of all bank accounts (users).
-    """
     if session.get('user_type') != 'admin':
         flash('Unauthorized access.', 'danger')
         return redirect(url_for('login'))
-    
     conn = get_db()
-    if conn is None:
-        flash('Database error. Cannot retrieve users.', 'danger')
-        return render_template('admin_users.html', users=[])
-
+    cur = conn.cursor()
     users = []
-    cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT * FROM bank_accounts")
-        users = cursor.fetchall()
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM bank_accounts")
+        rows = cur.fetchall()
+        users = [dict(r) for r in rows]
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if conn.is_connected():
-            cursor.close()
+        cur.close()
     return render_template('admin_users.html', users=users)
+
 @app.route('/admin/merchants')
 def admin_merchants_page():
-    """
-    Displays a list of all registered merchants.
-    """
-    # Check if the user is admin
     if session.get('user_type') != 'admin':
         flash('Unauthorized access.', 'danger')
         return redirect(url_for('login'))
-
-    # Get database connection
     conn = get_db()
-    if conn is None:
-        flash('Database error. Cannot retrieve merchants.', 'danger')
-        return render_template('admin_merchants.html', merchants=[])
-
-    # Retrieve merchants
+    cur = conn.cursor()
     merchants = []
-    cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT * FROM merchants")
-        merchants = cursor.fetchall()
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM merchants")
+        merchants = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if cursor:
-            cursor.close()
-
+        cur.close()
     return render_template('admin_merchants.html', merchants=merchants)
 
 @app.route('/admin/transactions')
 def admin_transactions_page():
-    """
-    Displays all transactions in the system.
-    """
     if session.get('user_type') != 'admin':
         flash('Unauthorized access.', 'danger')
         return redirect(url_for('login'))
-    
     conn = get_db()
-    if conn is None:
-        flash('Database error. Cannot retrieve transactions.', 'danger')
-        return render_template('admin_transactions.html', transactions=[])
-
+    cur = conn.cursor()
     transactions = []
-    cursor = conn.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT * FROM transactions ORDER BY trans_date DESC")
-        transactions = cursor.fetchall()
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM transactions ORDER BY trans_date DESC")
+        transactions = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if conn.is_connected():
-            cursor.close()
+        cur.close()
     return render_template('admin_transactions.html', transactions=transactions)
 
 @app.route('/admin/create_account', methods=['GET', 'POST'])
 def admin_create_account():
-    """
-    Allows admin to create new bank accounts.
-    """
     if session.get('user_type') != 'admin':
         flash('Unauthorized access.', 'danger')
         return redirect(url_for('login'))
-    
     if request.method == 'POST':
         full_name = request.form.get('full_name')
         dob_str = request.form.get('dob')
         mobile_number = request.form.get('mobile_number')
         email = request.form.get('email')
         location = request.form.get('location')
-        state = request.form.get('state') # This needs to be the numerical ID for consistency with dataset
+        state = request.form.get('state')
         zip_code = request.form.get('zip')
 
-        # Basic validation
         if not all([full_name, dob_str, mobile_number, email, location, state, zip_code]):
             flash('All fields are required!', 'danger')
             return render_template('admin_create_account.html')
 
         try:
-            dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
+            datetime.strptime(dob_str, '%Y-%m-%d')
         except ValueError:
             flash('Invalid date format for Date of Birth. Please use YYYY-MM-DD.', 'danger')
             return render_template('admin_create_account.html')
 
         conn = get_db()
-        if conn is None:
-            flash('Database error. Cannot create account.', 'danger')
-            return render_template('admin_create_account.html')
-
-        cursor = conn.cursor()
+        cur = conn.cursor()
         try:
-            cursor.execute(
-                'INSERT INTO bank_accounts (full_name, dob, mobile_number, email, location, state, zip) VALUES (%s, %s, %s, %s, %s, %s, %s)',
-                (full_name, dob, mobile_number, email, location, state, zip_code)
-            )
+            cur.execute("""
+                INSERT INTO bank_accounts (full_name, dob, mobile_number, email, location, state, zip)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (full_name, dob_str, mobile_number, email, location, int(state), int(zip_code)))
             conn.commit()
             flash('Account created successfully!', 'success')
             return redirect(url_for('admin_users_page'))
-        except mysql.connector.IntegrityError as e:
-            if "Duplicate entry" in str(e) and ("'mobile_number'" in str(e) or "'email'" in str(e)):
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
                 flash('Mobile number or email already registered.', 'danger')
             else:
                 flash(f'Database error: {e}', 'danger')
         except Exception as e:
             flash(f'An unexpected error occurred: {e}', 'danger')
         finally:
-            if conn.is_connected():
-                cursor.close()
+            cur.close()
     return render_template('admin_create_account.html')
 
-# --- Merchant Routes ---
-
+# ---------- Merchant routes ----------
 @app.route('/merchant_dashboard')
 def merchant_dashboard():
-    """
-    Displays the merchant dashboard, showing transactions received by them.
-    Requires user to be logged in as 'merchant'.
-    """
-    if session.get('user_type') not in ['user', 'merchant']: # Allow users to become merchants
+    if session.get('user_type') not in ['user', 'merchant']:
         flash('Please log in to access the merchant panel.', 'warning')
         return redirect(url_for('login'))
-
     merchant_mobile = session['mobile']
     conn = get_db()
-    if conn is None:
-        flash('Database connection error. Cannot retrieve merchant details.', 'danger')
-        return redirect(url_for('user_dashboard')) # Redirect to user dashboard if merchant details fail
-
-    cursor = conn.cursor(dictionary=True)
+    cur = conn.cursor()
     user_info = None
     merchant_info = None
     transactions = []
-
     try:
-        cursor.execute("SELECT * FROM bank_accounts WHERE mobile_number = %s", (merchant_mobile,))
-        user_info = cursor.fetchone()
+        cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (merchant_mobile,))
+        row = cur.fetchone()
+        user_info = dict(row) if row else None
 
-        cursor.execute("SELECT * FROM merchants WHERE mobile_number = %s", (merchant_mobile,))
-        merchant_info = cursor.fetchone()
+        cur.execute("SELECT * FROM merchants WHERE mobile_number = ?", (merchant_mobile,))
+        mrow = cur.fetchone()
+        merchant_info = dict(mrow) if mrow else None
 
         if not merchant_info:
             flash('You need to set up your merchant account first.', 'info')
             return redirect(url_for('merchant_setup'))
 
-        # Fetch transactions received by this merchant
-        cursor.execute('SELECT * FROM transactions WHERE merchant_upi = %s ORDER BY trans_date DESC', (merchant_info['upi_number'],))
-        transactions = cursor.fetchall()
-    except mysql.connector.Error as err:
-        flash(f'Database error: {err}', 'danger')
+        cur.execute("SELECT * FROM transactions WHERE merchant_upi = ? ORDER BY trans_date DESC", (merchant_info['upi_number'],))
+        transactions = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        flash(f'Database error: {e}', 'danger')
     finally:
-        if conn.is_connected():
-            cursor.close()
+        cur.close()
     return render_template('merchant.html', user=user_info, merchant=merchant_info, transactions=transactions)
-
 
 @app.route('/merchant_setup', methods=['GET', 'POST'])
 def merchant_setup():
-    # Only logged-in users can access
     if 'user_type' not in session or session['user_type'] not in ['user', 'merchant']:
         flash('Please log in to set up a merchant account.', 'warning')
         return redirect(url_for('login'))
-
     conn = get_db()
-    if conn is None:
-        flash('Database connection error.', 'danger')
-        return render_template('merchant_setup.html')
-
-    cursor = conn.cursor(dictionary=True)
-
-    # Check if merchant already exists
+    cur = conn.cursor()
     try:
-        cursor.execute("SELECT * FROM merchants WHERE mobile_number = %s", (session['mobile'],))
-        existing = cursor.fetchone()
-        if existing:
+        cur.execute("SELECT * FROM merchants WHERE mobile_number = ?", (session['mobile'],))
+        if cur.fetchone():
             flash('You already have a merchant account.', 'info')
             return redirect(url_for('merchant_dashboard'))
-    except mysql.connector.Error as e:
+    except Exception as e:
         flash(f'Database error: {e}', 'danger')
         return render_template('merchant_setup.html')
 
     if request.method == 'POST':
         upi_number = request.form.get('upi_number')
         category = request.form.get('category')
-
         if not upi_number or not category:
             flash('UPI Number and Category are required.', 'danger')
             return render_template('merchant_setup.html')
-
         try:
-            cursor.execute(
-                "INSERT INTO merchants (mobile_number, upi_number, category) VALUES (%s, %s, %s)",
-                (session['mobile'], upi_number, category)
-            )
+            cur.execute("INSERT INTO merchants (mobile_number, upi_number, category) VALUES (?, ?, ?)",
+                        (session['mobile'], upi_number, int(category)))
             conn.commit()
             session['user_type'] = 'merchant'
             flash('Merchant account created successfully!', 'success')
             return redirect(url_for('merchant_dashboard'))
-        except mysql.connector.IntegrityError as e:
-            if "Duplicate entry" in str(e):
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
                 flash('This UPI number is already taken.', 'danger')
             else:
                 flash(f'Database error: {e}', 'danger')
         except Exception as e:
             flash(f'Unexpected error: {e}', 'danger')
-    cursor.close()
-    if conn.is_connected():
-        conn.close()
-
+        finally:
+            cur.close()
+    else:
+        cur.close()
     return render_template('merchant_setup.html')
 
+# ----------------- App startup -----------------
 if __name__ == '__main__':
-    # Create the 'model' directory if it doesn't exist
+    # ensure model dir exists (keeps parity with original)
     if not os.path.exists('model'):
         os.makedirs('model')
-    load_ml_assets() # Call the function directly here
-    app.run(debug=True) # Run the Flask application in debug mode (set to False in production)
+
+    # initialize DB and ML
+    init_db()
+    load_ml_assets()
+
+    # run
+    app.run(debug=True)
