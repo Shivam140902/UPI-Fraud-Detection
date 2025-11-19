@@ -1,4 +1,4 @@
-# app.py -- SQLite-converted version (keeps ML)
+# app.py -- SQLite-converted version (full, DB-workable)
 import os
 import random
 import ssl
@@ -12,34 +12,34 @@ from flask import Flask, g, redirect, render_template, request, session, url_for
 from sklearn.preprocessing import StandardScaler
 import sqlite3
 
-# ---------------- Configuration ----------------
-# SQLite DB filename
-SQLITE_DB = os.environ.get("SQLITE_DB", "database.sqlite3")
+# ------------------ CONFIG ------------------
+BASE_DIR = os.path.dirname(__file__)
+SQLITE_DB_PATH = os.path.join(BASE_DIR, "upi_fraud.sqlite")
 
-# SMTP config
+# SMTP config (use env in production)
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "way2track01@gmail.com")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "masvczanrdbufpuq")
 
 # ML files (must exist in repo)
-DATASET_CSV = "upi_fraud_dataset.csv"
-MODEL_PATH = "model/project_model2.h5"
+DATASET_CSV = os.path.join(BASE_DIR, "upi_fraud_dataset.csv")
+MODEL_PATH = os.path.join(BASE_DIR, "model", "project_model2.h5")
 
-# Flask app
+# Flask
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "your_super_secret_key_change_this_in_production")
 
-# Globals for ML assets
+# Globals for ML
 model = None
 scaler = None
 
-# ---------------- SQLite helpers ----------------
+# ------------------ SQLite helpers ------------------
 def get_db():
-    """Return a connection to the SQLite DB (attached to flask.g)."""
+    """Return a connection to the SQLite DB (cached on flask.g)."""
     db = g.get("_sqlite_db", None)
     if db is None:
-        conn = sqlite3.connect(SQLITE_DB, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
+        conn = sqlite3.connect(SQLITE_DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         g._sqlite_db = conn
         db = conn
@@ -53,9 +53,10 @@ def close_db(exception):
 
 def init_db():
     """Create required tables if they don't exist."""
-    conn = get_db()
+    conn = sqlite3.connect(SQLITE_DB_PATH)
     cur = conn.cursor()
-    # bank_accounts: OTP fields as text, otp_expiry as ISO string
+
+    # bank_accounts
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bank_accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,6 +72,7 @@ def init_db():
         creation_date TEXT DEFAULT (datetime('now'))
     );
     """)
+
     # merchants
     cur.execute("""
     CREATE TABLE IF NOT EXISTS merchants (
@@ -78,9 +80,11 @@ def init_db():
         mobile_number TEXT,
         upi_number TEXT UNIQUE,
         category INTEGER,
+        setup_date TEXT DEFAULT (datetime('now')),
         FOREIGN KEY (mobile_number) REFERENCES bank_accounts(mobile_number)
     );
     """)
+
     # transactions
     cur.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
@@ -102,6 +106,9 @@ def init_db():
     );
     """)
     conn.commit()
+    cur.close()
+    conn.close()
+    print("SQLite DB initialized:", SQLITE_DB_PATH)
 
 # ---------------- ML loading ----------------
 def load_ml_assets():
@@ -123,11 +130,12 @@ def load_ml_assets():
 
     # Load model
     try:
-        model = tf.keras.models.load_model(MODEL_PATH)
-        print("Model loaded successfully.")
-    except (FileNotFoundError, IOError):
-        model = None
-        print(f"Error: '{MODEL_PATH}' not found. Model not loaded.")
+        if os.path.exists(MODEL_PATH):
+            model = tf.keras.models.load_model(MODEL_PATH)
+            print("Model loaded successfully.")
+        else:
+            model = None
+            print(f"Model not found at {MODEL_PATH}")
     except Exception as e:
         model = None
         print(f"Error loading model: {e}")
@@ -154,7 +162,6 @@ def parse_iso_datetime(s):
     if not s:
         return None
     try:
-        # try full datetime first
         return datetime.fromisoformat(s)
     except Exception:
         try:
@@ -175,7 +182,7 @@ def predict_fraud(transaction_features):
         input_array = np.array(transaction_features).reshape(1, -1)
         scaled = scaler.transform(input_array)
         pred = model.predict(scaled)
-        # Try to handle multiple output shapes
+        # flatten
         if isinstance(pred, np.ndarray):
             p = pred.flatten()[0]
         else:
@@ -211,6 +218,7 @@ def login():
             mobile_number = request.form.get('mobile_number')
             if not mobile_number:
                 flash('Mobile number is required for user login.', 'danger')
+                cur.close()
                 return render_template('login.html')
             try:
                 cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (mobile_number,))
@@ -225,6 +233,7 @@ def login():
                         session['mobile'] = mobile_number
                         session['user_type'] = 'user'
                         flash('OTP sent to your registered email. Please verify to log in.', 'info')
+                        cur.close()
                         return redirect(url_for('verify_otp', mobile=mobile_number))
                     else:
                         flash('Failed to send OTP. Please try again.', 'danger')
@@ -241,7 +250,6 @@ def login():
             if not username or not password:
                 flash('Username and password are required for admin login.', 'danger')
                 return render_template('login.html')
-            # Hardcoded admin (you can replace with DB later)
             if username == 'admin' and password == 'admin':
                 session['mobile'] = '0000000000'
                 session['user_type'] = 'admin'
@@ -272,22 +280,23 @@ def verify_otp(mobile):
                 expiry_raw = row["otp_expiry"]
                 expiry_dt = parse_iso_datetime(expiry_raw)
                 if stored_otp == user_otp and expiry_dt and expiry_dt > datetime.now():
-                    # clear otp
                     cur.execute("UPDATE bank_accounts SET otp = NULL, otp_expiry = NULL WHERE mobile_number = ?", (mobile,))
                     conn.commit()
-                    # check merchant
                     cur.execute("SELECT * FROM merchants WHERE mobile_number = ?", (mobile,))
                     merchant_info = cur.fetchone()
                     if merchant_info:
                         session['user_type'] = 'merchant'
                         flash('Login successful as Merchant!', 'success')
+                        cur.close()
                         return redirect(url_for('merchant_dashboard'))
                     else:
                         session['user_type'] = 'user'
                         flash('Login successful as User!', 'success')
+                        cur.close()
                         return redirect(url_for('user_dashboard'))
                 elif expiry_dt and expiry_dt <= datetime.now():
                     flash('OTP has expired. Please log in again to get a new OTP.', 'danger')
+                    cur.close()
                     return redirect(url_for('login'))
                 else:
                     flash('Invalid OTP. Please try again.', 'danger')
@@ -317,7 +326,6 @@ def register():
             return render_template('register.html')
 
         try:
-            # validate dob format
             datetime.strptime(dob_str, '%Y-%m-%d')
         except ValueError:
             flash('Invalid date format for Date of Birth. Please use YYYY-MM-DD.', 'danger')
@@ -336,6 +344,7 @@ def register():
             """, (full_name, dob_str, mobile_number, email, location, int(state), int(zip_code)))
             conn.commit()
             flash('Registration successful! You can now log in.', 'success')
+            cur.close()
             return redirect(url_for('login'))
         except Exception as e:
             flash(f'An unexpected error occurred: {e}', 'danger')
@@ -364,8 +373,7 @@ def user_dashboard():
     try:
         cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (user_mobile,))
         row = cur.fetchone()
-        if row:
-            user_info = dict(row)
+        user_info = dict(row) if row else None
     except Exception as e:
         flash(f'Database error: {e}', 'danger')
     finally:
@@ -389,11 +397,7 @@ def user_profile_page():
     try:
         cur.execute("SELECT * FROM bank_accounts WHERE mobile_number = ?", (user_mobile,))
         row = cur.fetchone()
-        if row:
-            user_info = dict(row)
-            if 'creation_date' in user_info and isinstance(user_info['creation_date'], str):
-                # try to parse it to presentable format on template if needed
-                user_info['creation_date_raw'] = user_info['creation_date']
+        user_info = dict(row) if row else None
     except Exception as e:
         flash(f'Database error: {e}', 'danger')
     finally:
@@ -418,8 +422,7 @@ def user_transactions_page():
     transactions = []
     try:
         cur.execute("SELECT * FROM transactions WHERE user_mobile = ? ORDER BY trans_date DESC", (user_mobile,))
-        rows = cur.fetchall()
-        transactions = [dict(r) for r in rows]
+        transactions = [dict(r) for r in cur.fetchall()]
     except Exception as e:
         flash(f'Database error: {e}', 'danger')
     finally:
@@ -447,21 +450,20 @@ def user_pay():
     conn = get_db()
     cur = conn.cursor()
     try:
-        # user details
         cur.execute("SELECT dob, state, zip FROM bank_accounts WHERE mobile_number = ?", (user_mobile,))
         user_details = cur.fetchone()
         if not user_details:
             flash('User details not found. Cannot process payment.', 'danger')
+            cur.close()
             return redirect(url_for('user_make_payment_page'))
 
-        # merchant details
         cur.execute("SELECT category FROM merchants WHERE upi_number = ?", (merchant_upi,))
         merchant_details = cur.fetchone()
         if not merchant_details:
             flash('Merchant not found. Please check UPI number.', 'danger')
+            cur.close()
             return redirect(url_for('user_make_payment_page'))
 
-        # features
         now = datetime.now()
         trans_hour = now.hour
         trans_day = now.day
@@ -469,7 +471,6 @@ def user_pay():
         trans_year = now.year
         category = int(merchant_details["category"])
 
-        # calculate age (dob stored as YYYY-MM-DD)
         dob_str = user_details["dob"]
         try:
             dob_dt = datetime.strptime(dob_str, "%Y-%m-%d")
@@ -480,18 +481,11 @@ def user_pay():
         state = int(user_details["state"]) if user_details["state"] is not None else 0
         zip_code = int(user_details["zip"]) if user_details["zip"] is not None else 0
 
-        transaction_features = [
-            trans_hour, trans_day, trans_month, trans_year,
-            category, 0,  # dummy upi id
-            age, trans_amount, state, zip_code
-        ]
+        transaction_features = [trans_hour, trans_day, trans_month, trans_year, category, 0, age, trans_amount, state, zip_code]
 
-        # debug prints (visible on server logs)
         print("Transaction features (before scaling):", transaction_features)
 
-        features_scaled = scaler.transform([transaction_features])
-        print("Transaction features (after scaling):", features_scaled)
-
+        # Use predict_fraud which scales and uses model
         fraud_risk = predict_fraud(transaction_features)
         print("Predicted fraud risk:", fraud_risk)
 
@@ -505,14 +499,14 @@ def user_pay():
         """, (user_mobile, merchant_upi, trans_amount, status, trans_hour, trans_day, trans_month, trans_year, category, age, state, zip_code, now.date().isoformat()))
         conn.commit()
 
+        cur.close()
         return render_template('result.html', status=status.lower(), OUTPUT=output_message)
 
     except Exception as e:
         flash(f'An unexpected error occurred: {e}', 'danger')
         print(f"Error in user_pay: {e}")
-        return redirect(url_for('user_make_payment_page'))
-    finally:
         cur.close()
+        return redirect(url_for('user_make_payment_page'))
 
 # ---------- Admin routes ----------
 @app.route('/admin_dashboard')
@@ -532,8 +526,7 @@ def admin_users_page():
     users = []
     try:
         cur.execute("SELECT * FROM bank_accounts")
-        rows = cur.fetchall()
-        users = [dict(r) for r in rows]
+        users = [dict(r) for r in cur.fetchall()]
     except Exception as e:
         flash(f'Database error: {e}', 'danger')
     finally:
@@ -607,6 +600,7 @@ def admin_create_account():
             """, (full_name, dob_str, mobile_number, email, location, int(state), int(zip_code)))
             conn.commit()
             flash('Account created successfully!', 'success')
+            cur.close()
             return redirect(url_for('admin_users_page'))
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed" in str(e):
@@ -642,6 +636,7 @@ def merchant_dashboard():
 
         if not merchant_info:
             flash('You need to set up your merchant account first.', 'info')
+            cur.close()
             return redirect(url_for('merchant_setup'))
 
         cur.execute("SELECT * FROM transactions WHERE merchant_upi = ? ORDER BY trans_date DESC", (merchant_info['upi_number'],))
@@ -663,9 +658,11 @@ def merchant_setup():
         cur.execute("SELECT * FROM merchants WHERE mobile_number = ?", (session['mobile'],))
         if cur.fetchone():
             flash('You already have a merchant account.', 'info')
+            cur.close()
             return redirect(url_for('merchant_dashboard'))
     except Exception as e:
         flash(f'Database error: {e}', 'danger')
+        cur.close()
         return render_template('merchant_setup.html')
 
     if request.method == 'POST':
@@ -673,6 +670,7 @@ def merchant_setup():
         category = request.form.get('category')
         if not upi_number or not category:
             flash('UPI Number and Category are required.', 'danger')
+            cur.close()
             return render_template('merchant_setup.html')
         try:
             cur.execute("INSERT INTO merchants (mobile_number, upi_number, category) VALUES (?, ?, ?)",
@@ -680,6 +678,7 @@ def merchant_setup():
             conn.commit()
             session['user_type'] = 'merchant'
             flash('Merchant account created successfully!', 'success')
+            cur.close()
             return redirect(url_for('merchant_dashboard'))
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed" in str(e):
@@ -696,13 +695,10 @@ def merchant_setup():
 
 # ----------------- App startup -----------------
 if __name__ == '__main__':
-    # ensure model dir exists (keeps parity with original)
-    if not os.path.exists('model'):
-        os.makedirs('model')
+    # ensure model dir exists
+    if not os.path.exists(os.path.join(BASE_DIR, "model")):
+        os.makedirs(os.path.join(BASE_DIR, "model"))
 
-    # initialize DB and ML
-    init_db()
+    init_db()       # create sqlite file + tables if missing
     load_ml_assets()
-
-    # run
     app.run(debug=True)
