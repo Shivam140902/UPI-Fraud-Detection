@@ -110,7 +110,7 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
-    print("SQLite DB initialized:", SQLITE_DB_PATH)
+    print("SQLite DB initialized:", SQLITE_DB)
 
 # ---------------- ML loading ----------------
 def load_ml_assets():
