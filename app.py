@@ -14,11 +14,13 @@ import os
 # This dictionary holds your MySQL database connection details.
 # Replace 'root' with your MySQL username, '' with your password, and 'upi_fraud1' with your database name.
 DB_CONFIG = {
-    'user': 'root',
+    'user': 'shivam',
     'password': 'Shivam@4408',
-    'host': 'localhost',
-    'database': 'upi_fraud1'
+    'host': 'db4free.net',
+    'database': 'upi_fraud_db',
+    'port': 3306
 }
+
 
 # --- SMTP Configuration for Email (IMPORTANT: Update your credentials) ---
 # These are used for sending OTPs via email.
