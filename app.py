@@ -55,7 +55,7 @@ def close_db(exception):
 
 def init_db():
     """Create required tables if they don't exist."""
-    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn = sqlite3.connect(SQLITE_DB)
     cur = conn.cursor()
 
     # bank_accounts
