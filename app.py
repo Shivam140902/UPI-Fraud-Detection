@@ -14,7 +14,8 @@ import sqlite3
 
 # ------------------ CONFIG ------------------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-SQLITE_DB = os.path.join(BASE_DIR, "upi_fraud.sqlite")
+SQLITE_DB_PATH = os.path.join(BASE_DIR, "upi_fraud.sqlite")
+
 
 
 
@@ -41,7 +42,7 @@ def get_db():
     """Return a connection to the SQLite DB (cached on flask.g)."""
     db = g.get("_sqlite_db", None)
     if db is None:
-        conn = sqlite3.connect(SQLITE_DB, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
+        conn = sqlite3.connect(SQLITE_DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         g._sqlite_db = conn
         db = conn
@@ -55,7 +56,7 @@ def close_db(exception):
 
 def init_db():
     """Create required tables if they don't exist."""
-    conn = sqlite3.connect(SQLITE_DB)
+    conn = sqlite3.connect(SQLITE_DB_PATH)
     cur = conn.cursor()
 
     # bank_accounts
