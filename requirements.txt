@@ -1,8 +1,8 @@
 Flask
-tensorflow
+gunicorn
+mysql-connector-python
+tensorflow-cpu
 numpy
 pandas
 scikit-learn
-joblib
-gunicorn
 
