@@ -15,6 +15,8 @@ import sqlite3
 # ------------------ CONFIG ------------------
 BASE_DIR = os.path.dirname(__file__)
 SQLITE_DB_PATH = os.path.join(BASE_DIR, "upi_fraud.sqlite")
+SQLITE_DB = SQLITE_DB_PATH
+
 
 # SMTP config (use env in production)
 SMTP_SERVER = "smtp.gmail.com"
