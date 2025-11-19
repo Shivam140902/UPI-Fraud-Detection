@@ -1,5 +1,3 @@
-
-# markdown
 # 🔐 SecurePay – UPI Fraud Detection System  
 A complete Flask-based UPI payment platform integrated with **Machine Learning–powered Fraud Detection**.  
 The system includes **User**, **Merchant**, and **Admin** dashboards, secure authentication, QR-based payments, and real-time fraud prediction.
@@ -212,5 +210,3 @@ This project is for educational and academic use.
 ---
 
 ⭐ *If you like this project, kindly star the repository!*
-
-```
