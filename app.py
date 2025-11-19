@@ -13,9 +13,9 @@ from sklearn.preprocessing import StandardScaler
 import sqlite3
 
 # ------------------ CONFIG ------------------
-BASE_DIR = os.path.dirname(__file__)
-SQLITE_DB_PATH = os.path.join(BASE_DIR, "upi_fraud.sqlite")
-SQLITE_DB = SQLITE_DB_PATH
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+SQLITE_DB = os.path.join(BASE_DIR, "upi_fraud.sqlite")
+
 
 
 # SMTP config (use env in production)
@@ -694,7 +694,6 @@ def merchant_setup():
     else:
         cur.close()
     return render_template('merchant_setup.html')
-
 # ----------------- App startup -----------------
 if __name__ == '__main__':
     # ensure model dir exists
@@ -703,4 +702,5 @@ if __name__ == '__main__':
 
     init_db()       # create sqlite file + tables if missing
     load_ml_assets()
-    app.run(debug=True)
+
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
