@@ -1,7 +1,6 @@
 Flask
 gunicorn
-tensorflow
-numpy
-pandas
-scikit-learn
-sqlite3-binary
+numpy==2.1.2
+pandas==2.2.2
+scikit-learn==1.5.2
+tensorflow==2.17.0
