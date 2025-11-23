@@ -6,6 +6,25 @@ The system includes **User**, **Merchant**, and **Admin** dashboards, secure aut
 Live link:- https://upi-fraud-detection-jcif.onrender.com/
 ---
 
+## 🛠 Technologies Used
+
+### Backend
+
+* Python
+* Flask
+* SQLAlchemy
+* Machine Learning Model (RandomForest / XGBoost)
+
+### Frontend
+
+* HTML5
+* Bootstrap 5
+* CSS
+* JavaScript
+* jsQR (QR decoding)
+* QRCode.js (QR generation)
+
+---
 ## 🚀 Features
 
 ### 👤 User Features
@@ -176,26 +195,6 @@ Mobile number → OTP generated internally
 2. Create accounts
 3. Monitor users, merchants & transactions
 4. Check fraud predictions
-
----
-
-## 🛠 Technologies Used
-
-### Backend
-
-* Python
-* Flask
-* SQLAlchemy
-* Machine Learning Model (RandomForest / XGBoost)
-
-### Frontend
-
-* HTML5
-* Bootstrap 5
-* CSS
-* JavaScript
-* jsQR (QR decoding)
-* QRCode.js (QR generation)
 
 ---
 
